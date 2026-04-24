@@ -5,19 +5,53 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 import os
 from pathlib import Path
+import json
+import secrets
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+security = HTTPBearer(auto_error=False)
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+
+def _load_teachers() -> dict[str, str]:
+    teachers_path = current_dir / "teachers.json"
+    with open(teachers_path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+teachers = _load_teachers()
+active_sessions: dict[str, str] = {}
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def require_teacher(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security)
+) -> str:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Teacher authentication required")
+
+    username = active_sessions.get(credentials.credentials)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token")
+
+    return username
 
 # In-memory activity database
 activities = {
@@ -88,8 +122,37 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def teacher_login(payload: LoginRequest):
+    expected_password = teachers.get(payload.username)
+    if expected_password is None or expected_password != payload.password:
+        raise HTTPException(status_code=401, detail="Invalid teacher credentials")
+
+    token = secrets.token_urlsafe(32)
+    active_sessions[token] = payload.username
+    return {
+        "message": "Login successful",
+        "token": token,
+        "username": payload.username
+    }
+
+
+@app.post("/auth/logout")
+def teacher_logout(username: str = Depends(require_teacher),
+                   credentials: HTTPAuthorizationCredentials | None = Depends(security)):
+    if credentials is not None:
+        active_sessions.pop(credentials.credentials, None)
+
+    return {"message": f"{username} logged out"}
+
+
+@app.get("/auth/me")
+def get_current_teacher(username: str = Depends(require_teacher)):
+    return {"username": username}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, _: str = Depends(require_teacher)):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +174,7 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, _: str = Depends(require_teacher)):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
